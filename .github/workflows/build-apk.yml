@@ -21,16 +21,19 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Grant execute permission for gradlew
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
         run: chmod +x gradlew || true
 
       - name: Build debug APK
         run: |
           if [ -f ./gradlew ]; then
-            ./gradlew assembleDebug --stacktrace
+            ./gradlew assembleDebug --stacktrace --no-daemon
           else
-            echo "No gradlew found - project structure incomplete"
-            exit 1
+            gradle wrapper --gradle-version 8.11.1
+            ./gradlew assembleDebug --stacktrace --no-daemon
           fi
 
       - name: Upload APK
