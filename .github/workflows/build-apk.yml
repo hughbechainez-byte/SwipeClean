@@ -21,20 +21,14 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-
-      - name: Make gradlew executable
-        run: chmod +x gradlew || true
+      - name: Generate Gradle Wrapper
+        run: |
+          # Use system gradle to create a complete wrapper (including the jar)
+          gradle wrapper --gradle-version 8.11.1 --distribution-type bin
+          chmod +x gradlew
 
       - name: Build debug APK
-        run: |
-          if [ -f ./gradlew ]; then
-            ./gradlew assembleDebug --stacktrace --no-daemon
-          else
-            gradle wrapper --gradle-version 8.11.1
-            ./gradlew assembleDebug --stacktrace --no-daemon
-          fi
+        run: ./gradlew assembleDebug --stacktrace --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
