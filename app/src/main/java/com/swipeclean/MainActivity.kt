@@ -2,8 +2,10 @@ package com.swipeclean
 
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
-import android.provider.DocumentsContract
+import android.os.Environment
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -35,26 +37,48 @@ import androidx.documentfile.provider.DocumentFile
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import kotlinx.coroutines.launch
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
 
 class MainActivity : ComponentActivity() {
 
     private var treeUri by mutableStateOf<Uri?>(null)
+    private var useFullAccess by mutableStateOf(false)
+
     private val openTreeLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
     ) { uri ->
         uri?.let {
-            contentResolver.takePersistableUriPermission(
-                it,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-            )
+            try {
+                contentResolver.takePersistableUriPermission(
+                    it,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            } catch (_: SecurityException) {
+                // Some devices throw if already granted
+            }
             treeUri = it
+            useFullAccess = false
+        }
+    }
+
+    private val manageStorageLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        // Re-check after returning from settings
+        useFullAccess = Environment.isExternalStorageManager()
+        if (useFullAccess) {
+            treeUri = null // force reload via full access path
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Check if we already have full access
+        useFullAccess = Environment.isExternalStorageManager()
+
         setContent {
             MaterialTheme(
                 colorScheme = darkColorScheme(
@@ -67,7 +91,29 @@ class MainActivity : ComponentActivity() {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     SwipeCleanApp(
                         treeUri = treeUri,
-                        onPickFolder = { openTreeLauncher.launch(null) }
+                        useFullAccess = useFullAccess,
+                        onPickFolder = {
+                            // Start the picker already at Downloads when possible
+                            val initialUri = try {
+                                Uri.parse("content://com.android.externalstorage.documents/tree/primary%3ADownload")
+                            } catch (_: Exception) {
+                                null
+                            }
+                            openTreeLauncher.launch(initialUri)
+                        },
+                        onRequestFullAccess = {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                try {
+                                    val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                                    intent.data = Uri.parse("package:$packageName")
+                                    manageStorageLauncher.launch(intent)
+                                } catch (_: Exception) {
+                                    // Fallback to general all-files settings
+                                    val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                                    manageStorageLauncher.launch(intent)
+                                }
+                            }
+                        }
                     )
                 }
             }
@@ -76,35 +122,82 @@ class MainActivity : ComponentActivity() {
 }
 
 data class FileItem(
-    val document: DocumentFile,
+    val document: DocumentFile? = null,
+    val file: File? = null,
     val name: String,
     val size: Long,
     val mime: String?,
     val lastModified: Long,
     val isImage: Boolean,
     val isVideo: Boolean
-)
+) {
+    fun delete(): Boolean {
+        return when {
+            document != null -> document.delete()
+            file != null -> file.delete()
+            else -> false
+        }
+    }
+
+    fun getUri(): Uri? {
+        return document?.uri ?: file?.let { Uri.fromFile(it) }
+    }
+}
 
 enum class Screen { PICK, SWIPE, TRASH }
 
 @Composable
-fun SwipeCleanApp(treeUri: Uri?, onPickFolder: () -> Unit) {
+fun SwipeCleanApp(
+    treeUri: Uri?,
+    useFullAccess: Boolean,
+    onPickFolder: () -> Unit,
+    onRequestFullAccess: () -> Unit
+) {
     var screen by remember { mutableStateOf(Screen.PICK) }
     var files by remember { mutableStateOf<List<FileItem>>(emptyList()) }
     var currentIndex by remember { mutableStateOf(0) }
     var trash by remember { mutableStateOf<List<FileItem>>(emptyList()) }
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
 
-    // Load files when tree is selected
-    LaunchedEffect(treeUri) {
-        if (treeUri != null) {
+    // Load files when access is granted
+    LaunchedEffect(treeUri, useFullAccess) {
+        val list = mutableListOf<FileItem>()
+
+        if (useFullAccess) {
+            // Full storage access path - direct File API for Downloads
+            val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            if (downloads != null && downloads.exists() && downloads.isDirectory) {
+                downloads.listFiles()?.filter { it.isFile }?.forEach { f ->
+                    val name = f.name
+                    val mime = when {
+                        name.endsWith(".jpg", true) || name.endsWith(".jpeg", true) ||
+                        name.endsWith(".png", true) || name.endsWith(".webp", true) ||
+                        name.endsWith(".gif", true) || name.endsWith(".heic", true) -> "image/*"
+                        name.endsWith(".mp4", true) || name.endsWith(".mkv", true) ||
+                        name.endsWith(".webm", true) || name.endsWith(".3gp", true) ||
+                        name.endsWith(".mov", true) -> "video/*"
+                        else -> null
+                    }
+                    list.add(
+                        FileItem(
+                            file = f,
+                            name = name,
+                            size = f.length(),
+                            mime = mime,
+                            lastModified = f.lastModified(),
+                            isImage = mime?.startsWith("image/") == true,
+                            isVideo = mime?.startsWith("video/") == true
+                        )
+                    )
+                }
+            }
+        } else if (treeUri != null) {
+            // SAF path
             val root = DocumentFile.fromTreeUri(context, treeUri)
             if (root != null && root.isDirectory) {
-                val list = root.listFiles()
-                    .filter { it.isFile }
-                    .map { doc ->
-                        val mime = doc.type
+                root.listFiles().filter { it.isFile }.forEach { doc ->
+                    val mime = doc.type
+                    list.add(
                         FileItem(
                             document = doc,
                             name = doc.name ?: "unknown",
@@ -114,17 +207,26 @@ fun SwipeCleanApp(treeUri: Uri?, onPickFolder: () -> Unit) {
                             isImage = mime?.startsWith("image/") == true,
                             isVideo = mime?.startsWith("video/") == true
                         )
-                    }
-                    .sortedByDescending { it.lastModified }
-                files = list
-                currentIndex = 0
-                screen = if (list.isNotEmpty()) Screen.SWIPE else Screen.PICK
+                    )
+                }
             }
+        }
+
+        files = list.sortedByDescending { it.lastModified }
+        currentIndex = 0
+        if (list.isNotEmpty()) {
+            screen = Screen.SWIPE
         }
     }
 
     when (screen) {
-        Screen.PICK -> PickFolderScreen(onPickFolder = onPickFolder, hasFiles = files.isNotEmpty(), onStart = { screen = Screen.SWIPE })
+        Screen.PICK -> PickFolderScreen(
+            onPickFolder = onPickFolder,
+            onRequestFullAccess = onRequestFullAccess,
+            hasFullAccess = useFullAccess,
+            hasFiles = files.isNotEmpty(),
+            onStart = { screen = Screen.SWIPE }
+        )
         Screen.SWIPE -> {
             if (files.isEmpty() || currentIndex >= files.size) {
                 FinishedScreen(
@@ -142,9 +244,7 @@ fun SwipeCleanApp(treeUri: Uri?, onPickFolder: () -> Unit) {
                     remaining = files.size - currentIndex,
                     total = files.size,
                     trashCount = trash.size,
-                    onKeep = {
-                        currentIndex++
-                    },
+                    onKeep = { currentIndex++ },
                     onDelete = {
                         trash = trash + files[currentIndex]
                         currentIndex++
@@ -155,15 +255,10 @@ fun SwipeCleanApp(treeUri: Uri?, onPickFolder: () -> Unit) {
         }
         Screen.TRASH -> TrashReviewScreen(
             trash = trash,
-            onRestore = { item ->
-                trash = trash.filter { it != item }
-            },
+            onRestore = { item -> trash = trash.filter { it != item } },
             onEmptyTrash = {
-                // Permanently delete
-                trash.forEach { it.document.delete() }
+                trash.forEach { it.delete() }
                 trash = emptyList()
-                // Also remove from remaining files if any
-                files = files.filter { f -> trash.none { it.document.uri == f.document.uri } }
                 screen = Screen.SWIPE
             },
             onBack = { screen = Screen.SWIPE }
@@ -172,7 +267,13 @@ fun SwipeCleanApp(treeUri: Uri?, onPickFolder: () -> Unit) {
 }
 
 @Composable
-fun PickFolderScreen(onPickFolder: () -> Unit, hasFiles: Boolean, onStart: () -> Unit) {
+fun PickFolderScreen(
+    onPickFolder: () -> Unit,
+    onRequestFullAccess: () -> Unit,
+    hasFullAccess: Boolean,
+    hasFiles: Boolean,
+    onStart: () -> Unit
+) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -180,7 +281,12 @@ fun PickFolderScreen(onPickFolder: () -> Unit, hasFiles: Boolean, onStart: () ->
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        Icon(Icons.Default.CleaningServices, contentDescription = null, modifier = Modifier.size(80.dp), tint = MaterialTheme.colorScheme.primary)
+        Icon(
+            Icons.Default.CleaningServices,
+            contentDescription = null,
+            modifier = Modifier.size(80.dp),
+            tint = MaterialTheme.colorScheme.primary
+        )
         Spacer(Modifier.height(16.dp))
         Text("Swipe Clean", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(8.dp))
@@ -190,6 +296,8 @@ fun PickFolderScreen(onPickFolder: () -> Unit, hasFiles: Boolean, onStart: () ->
             color = Color.Gray
         )
         Spacer(Modifier.height(32.dp))
+
+        // Primary: SAF folder picker
         Button(
             onClick = onPickFolder,
             modifier = Modifier.fillMaxWidth().height(56.dp),
@@ -197,21 +305,70 @@ fun PickFolderScreen(onPickFolder: () -> Unit, hasFiles: Boolean, onStart: () ->
         ) {
             Icon(Icons.Default.FolderOpen, contentDescription = null)
             Spacer(Modifier.width(8.dp))
-            Text("Select Downloads (or any folder)")
+            Text("Select Downloads folder")
         }
-        if (hasFiles) {
+
+        Spacer(Modifier.height(12.dp))
+
+        // Secondary: Full storage access (bypasses the privacy restriction)
+        if (!hasFullAccess) {
+            OutlinedButton(
+                onClick = onRequestFullAccess,
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Icon(Icons.Default.Security, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Grant All Files Access (recommended)")
+            }
+        } else {
+            Text(
+                "✓ Full storage access granted",
+                color = Color(0xFF4CAF50),
+                fontWeight = FontWeight.Medium
+            )
+            Spacer(Modifier.height(8.dp))
+            Button(
+                onClick = onStart,
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Text("Start cleaning Downloads")
+            }
+        }
+
+        if (hasFiles && !hasFullAccess) {
             Spacer(Modifier.height(12.dp))
             OutlinedButton(onClick = onStart, modifier = Modifier.fillMaxWidth()) {
                 Text("Continue with previous folder")
             }
         }
-        Spacer(Modifier.height(24.dp))
-        Text(
-            "Tip: On the system picker, navigate to Downloads and tap \"Use this folder\".",
-            style = MaterialTheme.typography.bodySmall,
-            color = Color.Gray,
-            textAlign = TextAlign.Center
-        )
+
+        Spacer(Modifier.height(28.dp))
+
+        // Clear instructions about the privacy message
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF2A2A2A)),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text(
+                    "If you see \"To protect your privacy...\":",
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFFFFB74D)
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "1. Open the menu (≡) in the top-left of the system picker\n" +
+                    "2. Tap Downloads\n" +
+                    "3. Tap \"Use this folder\" at the bottom\n\n" +
+                    "OR use the \"Grant All Files Access\" button above — it completely avoids the restriction.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.LightGray,
+                    lineHeight = 18.sp
+                )
+            }
+        }
     }
 }
 
@@ -228,6 +385,7 @@ fun SwipeScreen(
     val offsetX = remember { Animatable(0f) }
     val scope = rememberCoroutineScope()
     val threshold = 300f
+    val context = LocalContext.current
 
     Column(modifier = Modifier.fillMaxSize()) {
         // Top bar with counter
@@ -310,11 +468,12 @@ fun SwipeScreen(
                             .background(Color(0xFF2A2A2A)),
                         contentAlignment = Alignment.Center
                     ) {
+                        val previewUri = item.getUri()
                         when {
-                            item.isImage || item.isVideo -> {
+                            (item.isImage || item.isVideo) && previewUri != null -> {
                                 AsyncImage(
-                                    model = ImageRequest.Builder(LocalContext.current)
-                                        .data(item.document.uri)
+                                    model = ImageRequest.Builder(context)
+                                        .data(previewUri)
                                         .crossfade(true)
                                         .build(),
                                     contentDescription = item.name,
@@ -327,7 +486,7 @@ fun SwipeScreen(
                                     Icon(
                                         imageVector = when {
                                             item.mime?.contains("pdf") == true -> Icons.Default.PictureAsPdf
-                                            item.mime?.contains("zip") == true || item.name.endsWith(".apk") -> Icons.Default.Archive
+                                            item.mime?.contains("zip") == true || item.name.endsWith(".apk", true) -> Icons.Default.Archive
                                             item.mime?.contains("audio") == true -> Icons.Default.AudioFile
                                             else -> Icons.Default.InsertDriveFile
                                         },
@@ -362,12 +521,22 @@ fun SwipeScreen(
 
             // Swipe hints
             if (offsetX.value > 50) {
-                Text("KEEP", color = Color(0xFF4CAF50), fontWeight = FontWeight.Bold, fontSize = 28.sp,
-                    modifier = Modifier.align(Alignment.CenterStart).padding(start = 24.dp))
+                Text(
+                    "KEEP",
+                    color = Color(0xFF4CAF50),
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 28.sp,
+                    modifier = Modifier.align(Alignment.CenterStart).padding(start = 24.dp)
+                )
             }
             if (offsetX.value < -50) {
-                Text("TRASH", color = Color(0xFFF44336), fontWeight = FontWeight.Bold, fontSize = 28.sp,
-                    modifier = Modifier.align(Alignment.CenterEnd).padding(end = 24.dp))
+                Text(
+                    "TRASH",
+                    color = Color(0xFFF44336),
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 28.sp,
+                    modifier = Modifier.align(Alignment.CenterEnd).padding(end = 24.dp)
+                )
             }
         }
 
